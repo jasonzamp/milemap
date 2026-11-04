@@ -3,7 +3,13 @@ import pytest
 
 from milemap.config import FuelFinderSettings
 from milemap.sources.fuel_finder.client import FuelFinderClient, PaginationResult, split_records
-from milemap.sources.fuel_finder.errors import ApiError, AuthError, GeoBlockedError
+from milemap.sources.fuel_finder.errors import (
+    ApiError,
+    AuthError,
+    DeadlineExceeded,
+    GeoBlockedError,
+    RateLimitedError,
+)
 
 S = FuelFinderSettings(client_id="cid-123456", client_secret="sec-abcdef",  # noqa: S106 (fake test value)
                        base_url="https://ff.test")
@@ -116,3 +122,40 @@ def test_split_records_shapes():
     assert split_records([{"a": 1}]) == ([{"a": 1}], {})
     assert split_records({"success": True, "data": [1]}) == ([1], {"success": True})
     assert split_records({"weird": 1}) == ([], {"weird": 1})
+
+
+def test_429_stops_immediately_without_retrying():
+    def handler(request):
+        if request.url.path.endswith("generate_access_token"):
+            return token_ok(request)
+        return httpx.Response(429, headers={"Retry-After": "120"})
+    c, calls = make_client(handler)
+    with pytest.raises(RateLimitedError) as e:
+        list(c.iter_batches("/p"))
+    assert calls["get"] == 1 and e.value.retry_after_s == 120
+
+
+def test_deadline_stops_before_backoff_would_overrun():
+    now = {"t": 0.0}
+
+    def handler(request):
+        if request.url.path.endswith("generate_access_token"):
+            return token_ok(request)
+        return httpx.Response(503)
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    c = FuelFinderClient(S, http=http, sleep=lambda s: now.__setitem__("t", now["t"] + s),
+                         clock=lambda: now["t"], min_interval_s=0, deadline=5.0)
+    with pytest.raises(DeadlineExceeded):
+        c.get("/p")
+
+
+def test_token_cache_is_private_and_reused(tmp_path):
+    cache = tmp_path / "token.json"
+    c1, calls1 = make_client(pages(0), token_cache=cache)
+    c1.get("/p", {"batch-number": 1})
+    assert calls1["token"] == 1
+    assert oct(cache.stat().st_mode & 0o777) == "0o600"
+    assert "sec-abcdef" not in cache.read_text()  # client secret never cached
+    c2, calls2 = make_client(pages(0), token_cache=cache)
+    c2.get("/p", {"batch-number": 1})
+    assert calls2["token"] == 0  # second run reuses the cached, still-valid token

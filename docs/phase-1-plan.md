@@ -275,7 +275,7 @@ On every PR: `ruff check` + `ruff format --check`, `pytest` (recorded fixtures o
 | 3 | `feat/fuel-finder-client` | auth + paged client + error types, tested with mocked responses | 1 |
 | 4 | **`feat/history-depth-probe`** | probe, **run on your Mac the day credentials arrive**, `docs/history-depth.md` | 2, 3, credentials |
 | 5 | `feat/fuel-finder-poller` | a small poller that **writes raw files only** to R2: prices and station incremental every 5 min, prices full hourly, stations full daily, `node_id` join check per run; retries; every run (including failures) logged; tolerant of missing fields | 4 |
-| 5b | `ops/mac-launchd` | **interim:** a launchd job runs the poller on your Mac while Azure isn't live; the run log shows the sleep gaps | 5 |
+| 5b | `ops/mac-launchd` | **interim:** a launchd job runs the poller on your Mac while Azure isn't live; the run log shows the sleep gaps. **Delivered together with step 5 (`feat/fuel-finder-collector`); live since 2026-11-04 22:38 UTC** | 5 |
 | 6 | `deploy/collector-uk` | ghcr.io image, Azure Container Apps Jobs (UK South), R2 bucket, re-run probe from Azure, then retire launchd | 5, Cloudflare account |
 | 7 | `feat/dbt-staging-fuel-finder` | dbt project, Fuel Finder staging models + tests, fixture raw store, `dbt build` in CI | 5 |
 | 8 | `feat/desnz-brent` | DESNZ weekly + Brent ingestion + staging | 2 |

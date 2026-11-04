@@ -99,26 +99,45 @@ class RawRunWriter:
         self.files: list[dict[str, Any]] = []
         self.batches: list[dict[str, Any]] = []
         self.rows_written = 0
+        self.records_returned = 0
+        self.skipped_unchanged = 0
         self._closed = False
 
     def add_batch(self, *, number: int, records: list[Any], path: str, params: dict[str, Any],
                   fetched_at: datetime, status: int, envelope: dict[str, Any] | None = None,
-                  elapsed_s: float | None = None, attempts: int | None = None) -> None:
+                  elapsed_s: float | None = None, attempts: int | None = None,
+                  request_id: str | None = None,
+                  last_hash_by_key: dict[str, str] | None = None, key_field: str = "node_id",
+                  ) -> None:
+        """Append a batch. If last_hash_by_key is given, records identical to the last stored
+        version for the same key are skipped (and counted), and the map is updated."""
         params_json = json.dumps(params, sort_keys=True)
+        written_in_batch = 0
         for i, rec in enumerate(records):
+            self.records_returned += 1
             text = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            if last_hash_by_key is not None and isinstance(rec, dict):
+                key = rec.get(key_field)
+                if key is not None:
+                    if last_hash_by_key.get(key) == digest:
+                        self.skipped_unchanged += 1
+                        continue
+                    last_hash_by_key[key] = digest
+            written_in_batch += 1
             self._rows["_run_id"].append(self.run_id)
             self._rows["_fetched_at_utc"].append(fetched_at)
             self._rows["_request_path"].append(path)
             self._rows["_request_params"].append(params_json)
             self._rows["_batch_number"].append(number)
             self._rows["_record_index"].append(i)
-            self._rows["_record_hash"].append(hashlib.sha256(text.encode()).hexdigest())
+            self._rows["_record_hash"].append(digest)
             self._rows["record_json"].append(text)
         self.batches.append({
             "batch_number": number, "status": status, "records": len(records),
+            "written": written_in_batch,
             "fetched_at_utc": fetched_at.isoformat(), "elapsed_s": elapsed_s,
-            "attempts": attempts, "envelope": envelope or {},
+            "attempts": attempts, "request_id": request_id, "envelope": envelope or {},
         })
         if len(self._rows["_run_id"]) >= self._flush_every:
             self.flush()
@@ -147,6 +166,8 @@ class RawRunWriter:
             "started_at_utc": self.started_at.isoformat(),
             "finished_at_utc": datetime.now(UTC).isoformat(),
             "status": status,
+            "records_returned": self.records_returned,
+            "skipped_unchanged": self.skipped_unchanged,
             "rows_written": self.rows_written,
             "files": self.files,
             "batches": self.batches,
@@ -160,3 +181,10 @@ class RawRunWriter:
         _write_once(path, lambda tmp: tmp.write_text(json.dumps(manifest, indent=2, default=str)))
         self._closed = True
         return path
+
+
+def write_json_once(root: Path, relpath: str, obj: Any) -> Path:
+    """Write a small JSON record (run log, gap record) write-once under root."""
+    path = Path(root) / relpath
+    _write_once(path, lambda tmp: tmp.write_text(json.dumps(obj, indent=2, default=str)))
+    return path

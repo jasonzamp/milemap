@@ -1,8 +1,10 @@
 """Polite, paged Fuel Finder API client.
 
-- One request at a time with a minimum gap (documented limit is about 100 requests/minute).
-- Retries with exponential backoff on timeouts, 429 and 5xx (the API had severe performance
-  problems at launch).
+Rules (see docs/compliance.md):
+- One request at a time with a minimum gap (live limit: 100 requests/minute, 1 concurrent).
+- HTTP 429: stop immediately (RateLimitedError). Retrying inside the 5-minute window only
+  extends the block and could count as trying to bypass the limit.
+- Timeouts and 5xx: a few retries with exponential backoff, never past the run's deadline.
 - 403 raises GeoBlockedError (the API only answers UK IP addresses).
 - 401 forces one token renewal, then fails.
 - Pagination: batch-number 1, 2, 3... until an empty batch or 404.
@@ -15,6 +17,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -23,14 +26,20 @@ from milemap import __version__
 from milemap.config import FuelFinderSettings
 from milemap.redact import redact
 from milemap.sources.fuel_finder.auth import TokenManager
-from milemap.sources.fuel_finder.errors import ApiError, GeoBlockedError
+from milemap.sources.fuel_finder.errors import (
+    ApiError,
+    DeadlineExceeded,
+    GeoBlockedError,
+    RateLimitedError,
+)
 
 log = logging.getLogger(__name__)
 
 PRICES_PATH = "/api/v1/pfs/fuel-prices"
 STATIONS_PATH = "/api/v1/pfs"
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_STATUSES = {500, 502, 503, 504}
 USER_AGENT = f"MileMap/{__version__} (+https://github.com/jasonzamp/milemap)"
+MAX_REQUEST_TIMEOUT_S = 90.0
 
 
 @dataclass
@@ -44,6 +53,7 @@ class Batch:
     fetched_at: datetime
     elapsed_s: float
     attempts: int
+    request_id: str | None = None
 
 
 @dataclass
@@ -54,12 +64,14 @@ class Response:
     elapsed_s: float
     attempts: int
     error: str | None = None
+    request_id: str | None = None
 
 
 @dataclass
 class PaginationResult:
     batches_fetched: int = 0
     stopped_because: str = ""  # "empty" | "404" | "cap"
+    first_batch_404: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -85,15 +97,17 @@ class FuelFinderClient:
         settings: FuelFinderSettings,
         *,
         min_interval_s: float = 0.75,
-        max_retries: int = 5,
+        max_retries: int = 3,
         backoff_base_s: float = 2.0,
         http: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        token_cache: Path | None = None,
+        deadline: float | None = None,
     ):
         self._s = settings
         self._http = http or httpx.Client(
-            timeout=httpx.Timeout(90.0, connect=15.0),
+            timeout=httpx.Timeout(MAX_REQUEST_TIMEOUT_S, connect=15.0),
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         )
         self._sleep = sleep
@@ -102,13 +116,25 @@ class FuelFinderClient:
         self._max_retries = max_retries
         self._backoff = backoff_base_s
         self._last_request = -1e9
-        self.tokens = TokenManager(settings, self._http, clock=clock)
+        self.deadline = deadline  # in self._clock() units
+        self.tokens = TokenManager(settings, self._http, cache_path=token_cache)
         self.request_count = 0
         self.retry_count = 0
+        self.status_counts: dict[int, int] = {}
+        self.request_ids: list[str] = []
+
+    def remaining_s(self) -> float | None:
+        return None if self.deadline is None else self.deadline - self._clock()
+
+    def _check_deadline(self, need_s: float = 0.0) -> None:
+        rem = self.remaining_s()
+        if rem is not None and rem <= need_s:
+            raise DeadlineExceeded(f"Run time budget used up ({rem:.0f}s left)")
 
     def _throttle(self) -> None:
         wait = self._min_interval - (self._clock() - self._last_request)
         if wait > 0:
+            self._check_deadline(wait)
             self._sleep(wait)
         self._last_request = self._clock()
 
@@ -121,15 +147,20 @@ class FuelFinderClient:
         reauthed = False
         last_problem = ""
         for attempt in range(1, self._max_retries + 2):
+            self._check_deadline(1.0)
             self._throttle()
             started = self._clock()
             fetched_at = datetime.now(UTC)
+            rem = self.remaining_s()
+            timeout = MAX_REQUEST_TIMEOUT_S if rem is None else max(1.0, min(
+                MAX_REQUEST_TIMEOUT_S, rem))
             try:
                 token = self.tokens.token()
                 r = self._http.get(
                     self._s.base_url + path,
                     params=params,
                     headers={"Authorization": f"Bearer {token}"},
+                    timeout=timeout,
                 )
             except httpx.TransportError as e:
                 self.request_count += 1
@@ -137,12 +168,23 @@ class FuelFinderClient:
                 self._retry_wait(attempt, None, last_problem, path, params)
                 continue
             self.request_count += 1
+            self.status_counts[r.status_code] = self.status_counts.get(r.status_code, 0) + 1
+            rid = r.headers.get("x-amz-cf-id")
+            if rid:
+                self.request_ids.append(rid)
             elapsed = self._clock() - started
             if r.status_code == 403:
                 raise GeoBlockedError(
                     "HTTP 403 from Fuel Finder. The API only answers UK IP addresses: "
                     "check that no VPN is active."
                 )
+            if r.status_code == 429:
+                ra = r.headers.get("Retry-After")
+                try:
+                    ra_s = float(ra) if ra else None
+                except ValueError:
+                    ra_s = None
+                raise RateLimitedError(f"HTTP 429 on {path} {params}", ra_s)
             if r.status_code == 401 and not reauthed:
                 reauthed = True
                 self.tokens.invalidate()
@@ -154,13 +196,13 @@ class FuelFinderClient:
             if r.status_code >= 400:
                 return Response(
                     r.status_code, None, fetched_at, elapsed, attempt,
-                    error=redact(r.text[:300], self._secrets()),
+                    error=redact(r.text[:300], self._secrets()), request_id=rid,
                 )
             try:
                 body = r.json()
             except ValueError:
                 raise ApiError(f"Non-JSON response from {path}", r.status_code) from None
-            return Response(r.status_code, body, fetched_at, elapsed, attempt)
+            return Response(r.status_code, body, fetched_at, elapsed, attempt, request_id=rid)
         raise ApiError(f"Gave up on {path} {params} after retries (last: {last_problem})")
 
     def _retry_wait(self, attempt, retry_after, problem, path, params) -> None:
@@ -171,7 +213,8 @@ class FuelFinderClient:
             wait = float(retry_after) if retry_after else self._backoff * 2 ** (attempt - 1)
         except ValueError:
             wait = self._backoff * 2 ** (attempt - 1)
-        wait = min(wait, 120.0)
+        wait = min(wait, 60.0)
+        self._check_deadline(wait + 1.0)
         log.warning("%s on %s %s; retry %d in %.0fs", problem, path, params, attempt, wait)
         self._sleep(wait)
 
@@ -194,13 +237,14 @@ class FuelFinderClient:
             resp = self.get(path, p)
             if resp.status == 404:
                 result.stopped_because = "404"
+                result.first_batch_404 = n == 1
                 return
             if resp.status >= 400:
                 raise ApiError(f"HTTP {resp.status} on {path} {p}: {resp.error}", resp.status)
             records, envelope = split_records(resp.body)
             result.batches_fetched += 1
             yield Batch(n, resp.status, records, envelope, path, p, resp.fetched_at,
-                        resp.elapsed_s, resp.attempts)
+                        resp.elapsed_s, resp.attempts, resp.request_id)
             if not records:
                 result.stopped_because = "empty"
                 return
