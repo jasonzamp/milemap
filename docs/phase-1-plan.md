@@ -14,7 +14,7 @@ Everything below must be checked against the official developer portal (`https:/
 | Auth | OAuth 2.0 client credentials; `POST /api/v1/oauth/generate_access_token`; token lasts ~1 h; a refresh endpoint exists | GOV.UK guidance; dev.to write-up | Medium. Path and body format unconfirmed |
 | Stations | `GET /api/v1/pfs?batch-number=N`, 500 per batch | dev.to; `ukfuelfinder` lib | Medium |
 | Prices | `GET /api/v1/pfs/fuel-prices?batch-number=N` | dev.to | Medium |
-| Incremental | A "changed since" mode exists for prices and stations; the library passes a `YYYY-MM-DD` date | `ukfuelfinder` lib | **Low.** HTTP path and param name unknown |
+| Incremental | **Tested 2026-11-04, see [history-depth.md](history-depth.md).** `effective-start-timestamp` works to the second; returns the **latest price only (no change log, no backfill possible)**; filters per station; pages shift while data changes | Live probe | High |
 | Pagination | No total count. Stop on an empty or short batch (<500); invalid batch numbers return 404 | dev.to; lib changelog | Medium |
 | Keys / fields | `node_id` (station), `fuel_type`, price, `price_change_effective_timestamp`, `price_last_updated` (= last *change*, not last confirmation) | lib; dev.to | Medium |
 | Removed fields | `mft_organisation_name` removed Feb 2026; `success`/`message` removed | lib changelog | High |
