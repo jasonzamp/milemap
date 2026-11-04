@@ -160,13 +160,54 @@ File-based sources (CSV, DESNZ, Tankerkönig) keep the original file next to the
 - no batch errors were left unhandled.
 In Phase 2 the "publish current prices" step reads only from runs marked good, which keeps the previous good data live.
 
-**Storage backend:** local `./data/raw` in development. In production, an S3-compatible bucket (see open question 2). The code only sees an fsspec URL.
+**Storage backend:** local `./data/raw` in development, and **Cloudflare R2** in production (decided; see §3a). The code only sees an fsspec URL.
+
+**Write-time dedupe (protects the free storage budget):** if the incremental endpoint only accepts a *date* (not a datetime), each 5-minute poll re-returns every change since midnight. That's mostly the same records again and again. The collector therefore writes only records whose `_record_hash` it hasn't already stored for that "since" window. The manifest still records the full count returned, so the raw store stays a faithful log of every *distinct* observation without saving 288 copies a day.
 
 **Collector schedule (production):**
 - `prices_incremental` every 5 min, with a "since" that overlaps the last good watermark (exact overlap depends on probe step 5); duplicates are fine because staging dedupes;
 - `prices_full` daily as reconciliation (catches anything the incremental feed missed);
 - `stations_full` daily;
 - requests are sequential, with backoff on 429/5xx and an explicit `GeoBlockedError` on 403 so it isn't mistaken for an auth failure.
+
+---
+
+## 3a. Free hosting design (decided: £0/month target)
+
+### Collector: Azure Container Apps **Job** in UK South (consumption plan)
+Unlike the Azure free-account VM, which is only free for 12 months, the Container Apps consumption plan has a **monthly free grant that doesn't expire**: 180,000 vCPU-seconds, 360,000 GiB-seconds and 2 M requests per subscription. Jobs have no idle or request charges.
+
+| Job | Schedule | Size | Budget per month (worst case) |
+|---|---|---|---|
+| `prices-incremental` | cron `*/5 * * * *` | 0.25 vCPU / 0.5 GiB, timeout 60 s | 8,640 runs × 60 s → 129,600 vCPU-s, 259,200 GiB-s |
+| `prices-full` + `stations-full` | daily | same, timeout 10 min | ≤ 30 × 600 s → 4,500 vCPU-s, 9,000 GiB-s |
+| **Total (worst case)** | | | **~134k / 180k vCPU-s, ~268k / 360k GiB-s** — inside the grant |
+
+Typical runs should take 10–20 s, so real usage would be about a third of this.
+
+Hidden-cost traps and how we avoid each:
+- **Container registry:** Azure Container Registry Basic costs about $5/month, so we use **GitHub Container Registry (ghcr.io)** instead. Public images there are free, and the repo is public anyway.
+- **Log Analytics:** set the environment's logs destination to *none*; run logs go into our own manifests in R2.
+- **No VM, no public IP, no load balancer, no Azure Storage account:** state and raw files live in R2.
+- **Outbound bandwidth:** Azure's first 100 GB/month is free, and uploads to R2 are a few MB per day.
+- **Budget guardrail:** an Azure **budget alert at £1/month**. Azure free and pay-as-you-go accounts ask for a card for identity checks; the alert emails you before anything meaningful could be charged. (Pay-as-you-go has no hard spending cap, so the alert is the safety net.)
+
+**Risk:** Fuel Finder might block cloud data-centre IPs as well as non-UK ones. Mitigation: the very first thing deployed is the history-depth probe running *from the Azure job*, before we build on that assumption. Fallbacks, both free: (a) an Oracle Cloud "Always Free" VM in its London region; (b) a scheduled job on your Mac (has gaps when it sleeps).
+
+### Raw store: Cloudflare R2 (free tier)
+Free each month: **10 GB-month storage**, 1 M Class A (write) operations, 10 M Class B (read) operations, **no egress fees**. It's also where the Phase 2 website reads from.
+
+| Item | Estimate | Notes |
+|---|---|---|
+| Fuel Finder prices (incremental + daily full, Parquet zstd, deduped) | ~0.5–1.5 GB / year | ~8,400 stations × ~4 fuels |
+| Fuel Finder stations (daily full) | ~0.5–1 GB / year | could drop to "only when changed" if needed |
+| CSV fallback, DESNZ, Brent | < 0.2 GB / year | small |
+| Writes | ~30–50 k Class A / month | 3% of the free 1 M |
+| **Total UK raw** | **~1.5–3 GB / year** | **10 GB lasts roughly 3+ years** |
+
+- **Tankerkönig is not stored in R2.** The full German archive is many GB and can be re-downloaded at any time. It stays in a local cache on your Mac (git-ignored), and only small derived Lab outputs go to R2 later.
+- **Long-term overflow, still free:** the open dataset is published to a **Hugging Face dataset repo**, which is free for public datasets and has much more room than R2's free tier, plus GitHub Releases. Once a month is closed, its raw files are mirrored to Hugging Face, which doubles as an off-site immutable backup. If R2 ever nears 10 GB, older months can be served from Hugging Face. This is a later decision, and nothing is deleted without asking you.
+- Other free tiers compared: Backblaze B2 (10 GB, egress limits), Azure Blob (5 GB, 12 months only), Oracle (20 GB, but a separate account). R2 is the best fit because of zero egress and the Phase 2 website.
 
 ---
 
@@ -226,7 +267,7 @@ On every PR: `ruff check` + `ruff format --check`, `pytest` (recorded fixtures o
 | 3 | `feat/fuel-finder-client` | auth + paged client + error types, tested with mocked responses | 1 |
 | 4 | **`feat/history-depth-probe`** | probe + **run it on your Mac** + `docs/history-depth.md` | 2, 3, your credentials, endpoint details from the portal |
 | 5 | `feat/fuel-finder-collector` | incremental/full/stations jobs, validation gate, (backfill if the probe says so) | 4 |
-| 6 | `deploy/collector-uk` | container + schedule on the UK host → **archive clock starts** | 5, open question 1 |
+| 6 | `deploy/collector-uk` | ghcr.io image, Azure Container Apps Jobs (UK South), R2 bucket, £1 budget alert, re-run probe from Azure → **archive clock starts** | 5, your Azure + Cloudflare accounts |
 | 7 | `feat/dbt-staging-fuel-finder` | dbt project, Fuel Finder staging models + tests, fixture raw store, `dbt build` in CI | 5 |
 | 8 | `feat/fuel-finder-csv` | CSV fallback + staging | 2 |
 | 9 | `feat/desnz-brent` | DESNZ weekly + Brent ingestion + staging | 2 |
@@ -239,11 +280,15 @@ Steps 1–6 are the critical path to starting the archive, and steps 8–10 can 
 
 ## 8. Open questions for you
 
-1. **Collector host (ongoing cost).** CLAUDE.md specifies Azure UK South. The cheapest options are a B1s/B2ats VM (roughly £3–8/month) or a Container Apps scheduled job (possibly within the free grant). Do you approve one, or would you rather use a different UK host?
-2. **Raw object storage (ongoing cost).** Cloudflare R2 (free up to 10 GB, no egress fees, and it's where the Phase 2 site reads from anyway) or Azure Blob in the same region as the collector? My recommendation is R2.
-3. **GitHub repo.** Create it under `jasonzamp` or `556LowCodeNoCode`, and public now or at launch? (I haven't created any remote yet.)
-4. **Location.** The project is in `~/Desktop/milemap`, but your global instructions say projects live in `~/Projects`. Should I move it?
-5. **Endpoint details.** Once you have portal access, paste the incremental endpoint spec (path, param name, date format), or save the OpenAPI/Swagger file into `docs/`.
+Decided:
+- ~~Collector host~~: Azure UK South, **free only**, as a Container Apps Job within the monthly free grant (§3a).
+- ~~Raw storage~~: Cloudflare R2 free tier, with Hugging Face as free overflow and backup (§3a).
+- ~~GitHub repo~~: `jasonzamp/milemap`, public; the user is the sole contributor (no co-author trailers).
+- ~~Location~~: stays in `~/Desktop/milemap`.
+
+Still open:
+1. **Accounts you'll need to create** (all free; I can't do these for you): an Azure account (asks for a card for verification), a Cloudflare account with R2 enabled (R2 also asks for a payment method on file, though usage stays within the free tier), and later a Hugging Face account.
+2. **Endpoint details.** Once you have portal access, paste the incremental endpoint spec (path, param name, date format), or save the OpenAPI/Swagger file into `docs/`.
 
 ## Sources consulted for §0
 - GOV.UK: [Access the latest fuel prices and forecourt data via API or email](https://www.gov.uk/guidance/access-the-latest-fuel-prices-and-forecourt-data-via-api-or-email)
