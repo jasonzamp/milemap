@@ -1,0 +1,54 @@
+# ── Secrets ─────────────────────────────────────────────
+# Fuel Finder credentials, cloud keys, etc. live only in .env / secret stores.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ── Data (never committed; raw lives in object storage) ─
+data/
+!data/README.md
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.db
+*.csv
+*.csv.gz
+*.json.gz
+*.pmtiles
+# Small hand-maintained seed CSVs and test fixtures are allowed
+!dbt/seeds/*.csv
+!tests/fixtures/**
+
+# ── Python / uv ─────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# ── dbt ─────────────────────────────────────────────────
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+.user.yml
+logs/
+
+# ── Node (Phase 2 front end) ────────────────────────────
+node_modules/
+.svelte-kit/
+.wrangler/
+
+# ── Editors / OS ────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
