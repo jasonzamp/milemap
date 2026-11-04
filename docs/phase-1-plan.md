@@ -166,11 +166,13 @@ In Phase 2 the "publish current prices" step reads only from runs marked good, w
 
 **Write-time dedupe (protects the free storage budget):** if the incremental endpoint only accepts a *date* (not a datetime), each 5-minute poll re-returns every change since midnight. That's mostly the same records again and again. The collector therefore writes only records whose `_record_hash` it hasn't already stored for that "since" window. The manifest still records the full count returned, so the raw store stays a faithful log of every *distinct* observation without saving 288 copies a day.
 
-**Collector schedule (production):**
-- `prices_incremental` every 5 min, with a "since" that overlaps the last good watermark (exact overlap depends on probe step 5); duplicates are fine because staging dedupes;
-- `prices_full` daily as reconciliation (catches anything the incremental feed missed);
-- `stations_full` daily;
-- requests are sequential, with backoff on 429/5xx and an explicit `GeoBlockedError` on 403 so it isn't mistaken for an auth failure.
+**Collector schedule (production, revised after the history-depth test; see [history-depth.md](history-depth.md)):**
+- every 5 min: `prices_incremental` (since now − 2 h) **and** `stations_incremental` (since the start of the previous day); both overlap on purpose, and duplicates are dropped at write time by record hash;
+- hourly: `prices_full` (catches stations skipped while pages shift, and late submissions);
+- daily: `stations_full` (the only way to get every station: the incremental endpoint never returns ~3,800 stations untouched since before launch);
+- every run: the `node_id` join check (prices without a station record, and vice versa) goes into the manifest;
+- all of it appended write-once to R2 under `source=fuel_finder/endpoint=…`, never overwritten;
+- requests are sequential, with backoff on 429/5xx and an explicit `GeoBlockedError` on 403; a 404 on batch 1 of the stations endpoint means "no changes" but is logged.
 
 ---
 
@@ -181,11 +183,12 @@ Unlike the Azure free-account VM, which is only free for 12 months, the Containe
 
 | Job | Schedule | Size | Budget per month (worst case) |
 |---|---|---|---|
-| `prices-incremental` | cron `*/5 * * * *` | 0.25 vCPU / 0.5 GiB, timeout 60 s | 8,640 runs × 60 s → 129,600 vCPU-s, 259,200 GiB-s |
-| `prices-full` + `stations-full` | daily | same, timeout 10 min | ≤ 30 × 600 s → 4,500 vCPU-s, 9,000 GiB-s |
-| **Total (worst case)** | | | **~134k / 180k vCPU-s, ~268k / 360k GiB-s** — inside the grant |
+| `poll` (prices + stations incremental) | cron `*/5 * * * *` | 0.25 vCPU / 0.5 GiB, timeout 60 s | 8,640 runs × 60 s → 129,600 vCPU-s, 259,200 GiB-s |
+| `prices-full` | hourly | same, timeout 120 s | 720 × 120 s → 21,600 vCPU-s, 43,200 GiB-s |
+| `stations-full` | daily | same, timeout 120 s | 30 × 120 s → 900 vCPU-s, 1,800 GiB-s |
+| **Total (worst case)** | | | **~152k / 180k vCPU-s (85%), ~304k / 360k GiB-s (85%)**, inside the grant |
 
-Typical runs should take 10–20 s, so real usage would be about a third of this.
+Measured in the history-depth test: an incremental poll is 2–3 requests (a few seconds), and a full prices download is 17 requests in about 33 s. Realistic usage is therefore about 52k vCPU-s (~30% of the grant). The worst case assumes every run hits its timeout. If the margin ever gets tight, the hourly full download can drop to every 2 hours.
 
 Hidden-cost traps and how we avoid each:
 - **Container registry:** Azure Container Registry Basic costs about $5/month, so we use **GitHub Container Registry (ghcr.io)** instead. Public images there are free, and the repo is public anyway.
@@ -271,7 +274,7 @@ On every PR: `ruff check` + `ruff format --check`, `pytest` (recorded fixtures o
 | 3a | `feat/csv-recorder` *(only if you approve the email route, see §8)* | twice-daily public CSV saved raw via the subscription email | 2 |
 | 3 | `feat/fuel-finder-client` | auth + paged client + error types, tested with mocked responses | 1 |
 | 4 | **`feat/history-depth-probe`** | probe, **run on your Mac the day credentials arrive**, `docs/history-depth.md` | 2, 3, credentials |
-| 5 | `feat/fuel-finder-poller` | a small poller that **writes raw files only**: incremental every 5 min plus daily full prices and stations; retries; every run (including failures) logged; tolerant of missing fields | 4 |
+| 5 | `feat/fuel-finder-poller` | a small poller that **writes raw files only** to R2: prices and station incremental every 5 min, prices full hourly, stations full daily, `node_id` join check per run; retries; every run (including failures) logged; tolerant of missing fields | 4 |
 | 5b | `ops/mac-launchd` | **interim:** a launchd job runs the poller on your Mac while Azure isn't live; the run log shows the sleep gaps | 5 |
 | 6 | `deploy/collector-uk` | ghcr.io image, Azure Container Apps Jobs (UK South), R2 bucket, re-run probe from Azure, then retire launchd | 5, Cloudflare account |
 | 7 | `feat/dbt-staging-fuel-finder` | dbt project, Fuel Finder staging models + tests, fixture raw store, `dbt build` in CI | 5 |

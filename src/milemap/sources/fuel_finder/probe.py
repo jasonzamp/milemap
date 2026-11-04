@@ -19,6 +19,7 @@ from typing import Any
 from milemap.config import data_dir, fuel_finder_settings, raw_root
 from milemap.sources.fuel_finder.client import (
     PRICES_PATH,
+    STATIONS_PATH,
     FuelFinderClient,
     PaginationResult,
 )
@@ -196,16 +197,17 @@ class Probe:
         self.results: dict[str, Any] = {"runs": []}
 
     def run(self, label: str, endpoint: str, params: dict[str, Any], *,
-            max_batches: int | None, samples: int = 0, since_dt: datetime | None = None
-            ) -> RunStats:
-        stats = RunStats(label=label, params=params, since_dt=since_dt)
+            max_batches: int | None, samples: int = 0, since_dt: datetime | None = None,
+            path: str = PRICES_PATH, stats: Any = None) -> Any:
+        if stats is None:
+            stats = RunStats(label=label, params=params, since_dt=since_dt)
         writer = RawRunWriter(self.root, SOURCE, endpoint)
         pag = PaginationResult()
         t0 = datetime.now(UTC)
         status = "ok"
         log.info("▶ %s  params=%s  cap=%s", label, params, max_batches)
         try:
-            for b in self.c.iter_batches(PRICES_PATH, params, max_batches=max_batches,
+            for b in self.c.iter_batches(path, params, max_batches=max_batches,
                                          result=pag):
                 writer.add_batch(number=b.number, records=b.records, path=b.path,
                                  params=b.params, fetched_at=b.fetched_at, status=b.status,
@@ -324,6 +326,213 @@ def run_probe(*, quick: bool, max_batches_big: int = 6000, max_batches_window: i
     out_dir = data_dir() / "probe"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"history_depth_{probe.results['mode']}_{started:%Y%m%dT%H%M%SZ}.json"
+    out.write_text(json.dumps(probe.results, indent=2, default=str))
+    log.info("Summary written to %s", out)
+    return out
+
+
+# ── Stations (PFS information) ──────────────────────────────────────────────
+
+
+def _is_ts(value: Any) -> bool:
+    return isinstance(value, str) and len(value) >= 10 and value[4:5] == "-" and (
+        _parse_ts(value) is not None)
+
+
+def _field_paths(rec: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Top-level fields plus one nested level (dicts as a.b, lists of dicts as a[].b)."""
+    out: list[tuple[str, Any]] = []
+    for k, v in rec.items():
+        out.append((k, v))
+        if isinstance(v, dict):
+            out.extend((f"{k}.{kk}", vv) for kk, vv in v.items())
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    out.extend((f"{k}[].{kk}", vv) for kk, vv in item.items())
+    return out
+
+
+@dataclass
+class StationStats:
+    label: str
+    params: dict[str, Any]
+    since_dt: datetime | None = None
+    records: int = 0
+    price_rows: int = 0  # unused; keeps the shared log line simple
+    batches: int = 0
+    stopped_because: str = ""
+    seconds: float = 0.0
+    manifest: str | None = None
+    error: str | None = None
+    node_records: Counter = field(default_factory=Counter)
+    node_versions: dict = field(default_factory=lambda: defaultdict(set))
+    field_counts: Counter = field(default_factory=Counter)
+    field_types: dict = field(default_factory=lambda: defaultdict(Counter))
+    blank_counts: Counter = field(default_factory=Counter)
+    bool_counts: dict = field(default_factory=lambda: defaultdict(Counter))
+    ts_min: dict = field(default_factory=dict)
+    ts_max: dict = field(default_factory=dict)
+    ts_before_since: Counter = field(default_factory=Counter)
+    envelope_keys: Counter = field(default_factory=Counter)
+
+    def add_batch(self, records: list[Any], envelope: dict[str, Any]) -> None:
+        self.batches += 1
+        self.envelope_keys.update(envelope.keys())
+        for rec in records:
+            self.records += 1
+            if not isinstance(rec, dict):
+                self.field_types["<record>"][type(rec).__name__] += 1
+                continue
+            node = rec.get("node_id")
+            self.node_records[node] += 1
+            self.node_versions[node].add(json.dumps(rec, sort_keys=True))
+            seen: set[str] = set()
+            for path, v in _field_paths(rec):
+                if path not in seen:
+                    self.field_counts[path] += 1
+                    seen.add(path)
+                self.field_types[path][type(v).__name__] += 1
+                if v is None or v == "" or v == []:
+                    self.blank_counts[path] += 1
+                if isinstance(v, bool):
+                    self.bool_counts[path][v] += 1
+                if _is_ts(v):
+                    t = _parse_ts(v)
+                    if path not in self.ts_min or t < self.ts_min[path]:
+                        self.ts_min[path] = t
+                    if path not in self.ts_max or t > self.ts_max[path]:
+                        self.ts_max[path] = t
+                    if self.since_dt and t < self.since_dt:
+                        self.ts_before_since[path] += 1
+
+    def summary(self, *, samples: int = 0) -> dict[str, Any]:
+        versions = Counter(len(v) for v in self.node_versions.values())
+        return {
+            "label": self.label,
+            "params": self.params,
+            "batches": self.batches,
+            "stopped_because": self.stopped_because,
+            "seconds": round(self.seconds, 1),
+            "records": self.records,
+            "distinct_nodes": len(self.node_records),
+            "nodes_appearing_in_more_than_one_record": sum(
+                1 for c in self.node_records.values() if c > 1),
+            "distinct_versions_per_node_histogram": dict(sorted(versions.items())),
+            "fields_present_in_n_records": dict(self.field_counts.most_common()),
+            "field_types": {k: dict(v) for k, v in self.field_types.items()},
+            "blank_counts": dict(self.blank_counts.most_common()),
+            "boolean_counts": {k: {str(b): n for b, n in v.items()}
+                               for k, v in self.bool_counts.items()},
+            "timestamp_fields": {
+                k: {"min": self.ts_min[k].isoformat(), "max": self.ts_max[k].isoformat(),
+                    "values_before_since": self.ts_before_since.get(k, 0)}
+                for k in sorted(self.ts_min)
+            },
+            "envelope_keys": dict(self.envelope_keys),
+            "manifest": self.manifest,
+            "error": self.error,
+        }
+
+
+def _latest_full_nodes(root: Path, endpoint: str) -> tuple[str | None, set[str], dict]:
+    """node_ids (and records) from the largest successful full run of an endpoint."""
+    import pyarrow.parquet as pq
+
+    best = None
+    for m in (root / "_manifests" / f"source={SOURCE}" / f"endpoint={endpoint}").glob("*.json"):
+        man = json.loads(m.read_text())
+        if man.get("status") == "ok" and man.get("request_params") == {} and (
+                best is None or man["rows_written"] > best["rows_written"]):
+            best = man
+    if best is None:
+        return None, set(), {}
+    recs: dict[str, Any] = {}
+    for f in best["files"]:
+        for text in pq.read_table(root / f["path"], columns=["record_json"]).column(
+                "record_json").to_pylist():
+            r = json.loads(text)
+            if isinstance(r, dict) and r.get("node_id"):
+                recs[r["node_id"]] = r
+    return best["run_id"], set(recs), recs
+
+
+def join_check(root: Path) -> dict[str, Any]:
+    p_run, p_nodes, p_recs = _latest_full_nodes(root, "prices_full")
+    s_run, s_nodes, s_recs = _latest_full_nodes(root, "stations_full")
+    only_prices = sorted(p_nodes - s_nodes)
+    only_stations = sorted(s_nodes - p_nodes)
+
+    def describe(recs: dict, nodes: list[str], keys: tuple[str, ...]) -> list[dict]:
+        out = []
+        for n in nodes[:15]:
+            r = recs.get(n, {})
+            out.append({"node_id": n, **{k: r.get(k) for k in keys if k in r}})
+        return out
+
+    closure_keys = tuple(k for k in ("temporary_closure", "permanent_closure",
+                                     "permanent_closure_date") if any(
+        k in r for r in s_recs.values()))
+    closure_summary: dict[str, Counter] = {k: Counter() for k in closure_keys}
+    for n in only_stations:
+        for k in closure_keys:
+            closure_summary[k][str(s_recs[n].get(k))] += 1
+    return {
+        "prices_run": p_run, "stations_run": s_run,
+        "price_nodes": len(p_nodes), "station_nodes": len(s_nodes),
+        "in_both": len(p_nodes & s_nodes),
+        "prices_without_station_record": len(only_prices),
+        "stations_without_prices": len(only_stations),
+        "examples_prices_without_station": describe(p_recs, only_prices, ("trading_name",)),
+        "examples_stations_without_prices": describe(
+            s_recs, only_stations, ("trading_name", *closure_keys)),
+        "closure_flags_of_stations_without_prices": {
+            k: dict(v) for k, v in closure_summary.items()},
+    }
+
+
+def run_station_probe(*, max_batches: int = 400) -> Path:
+    settings = fuel_finder_settings()
+    client = FuelFinderClient(settings)
+    root = raw_root()
+    probe = Probe(client, root)
+    started = datetime.now(UTC)
+    probe.results.update({"started_at_utc": started.isoformat(), "mode": "stations",
+                          "base_url": settings.base_url})
+
+    def st(label: str, params: dict[str, Any], endpoint: str, since: datetime | None = None):
+        return probe.run(label, endpoint, params, max_batches=max_batches, path=STATIONS_PATH,
+                         stats=StationStats(label=label, params=params, since_dt=since))
+
+    try:
+        st("stations full", {}, "stations_full")
+        tomorrow = (started + timedelta(days=1)).date().isoformat()
+        st("stations control: since tomorrow", {"effective-start-timestamp": tomorrow},
+           "stations_incremental")
+        six_h = (started - timedelta(hours=6)).replace(microsecond=0)
+        st("stations: last 6h", {"effective-start-timestamp": six_h.strftime("%Y-%m-%d %H:%M:%S")},
+           "stations_incremental", six_h)
+        for days in (1, 7, 30, 90):
+            d = (started - timedelta(days=days)).date()
+            st(f"stations: since {days}d ago", {"effective-start-timestamp": d.isoformat()},
+               "stations_incremental", datetime(d.year, d.month, d.day, tzinfo=UTC))
+        st(f"stations: since launch {LAUNCH_DATE}", {"effective-start-timestamp": LAUNCH_DATE},
+           "stations_incremental", datetime(2026, 2, 2, tzinfo=UTC))
+        # Fresh full prices so the join compares two snapshots taken minutes apart.
+        probe.run("full prices (for join)", "prices_full", {}, max_batches=None)
+        probe.results["join"] = join_check(root)
+    except FuelFinderError as e:
+        probe.results["fatal"] = str(e)
+        log.error("✗ %s", e)
+
+    probe.results.update({
+        "finished_at_utc": datetime.now(UTC).isoformat(),
+        "requests": client.request_count, "retries": client.retry_count,
+        "tokens_generated": client.tokens.generate_count,
+    })
+    out_dir = data_dir() / "probe"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"history_depth_stations_{started:%Y%m%dT%H%M%SZ}.json"
     out.write_text(json.dumps(probe.results, indent=2, default=str))
     log.info("Summary written to %s", out)
     return out
