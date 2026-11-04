@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- MileMap Fuel Finder collector: one run every 5 minutes while you are logged in.
+     Interim until the Azure collector is live. Installed by deploy/mac/install.sh. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>uk.milemap.collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV__</string>
+    <string>run</string>
+    <string>--frozen</string>
+    <string>--quiet</string>
+    <string>--project</string>
+    <string>__REPO__</string>
+    <string>milemap</string>
+    <string>collect</string>
+    <string>tick</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MILEMAP_RUNNER</key>
+    <string>mac-launchd</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- launchd has no run-time limit: the collector enforces its own deadline (45 s, or 120 s
+       with a full download) plus a SIGALRM backstop, and a lock file stops runs overlapping.
+       ExitTimeOut only applies when the job is stopped (SIGTERM, then SIGKILL after 20 s). -->
+  <key>ExitTimeOut</key>
+  <integer>20</integer>
+  <key>StandardOutPath</key>
+  <string>__REPO__/data/logs/collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/data/logs/collector.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
