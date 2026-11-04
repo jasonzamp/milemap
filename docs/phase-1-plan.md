@@ -21,9 +21,11 @@ Everything below must be checked against the official developer portal (`https:/
 | Rate limit | ~100 requests/min, **one request at a time** | dev.to (quoting the docs) | Medium |
 | Geo | 403 from non-UK IPs | dev.to; CLAUDE.md | High |
 | Data quirks | Duplicate rows; country field inconsistent; postcodes missing the space; some lat/lon swapped or sign-flipped; `00:00–00:00` + `is_24_hours=false` means "not filled in" | dev.to | Medium |
-| Public CSV | Updated twice daily, also offered by email link; **URL not yet known** | GOV.UK guidance | Must find |
+| Public CSV | Updated twice daily. **No stable public URL.** The download button calls an internal endpoint (`/internal/v1.0.2/csv/generate-presigned-url`) whose response is **encrypted for the browser**, so it's deliberately not meant for scripts and we won't work around that. Sanctioned automated routes: the **email subscription** (a link to each new CSV) or the API | Developer-portal page scripts, checked 2026-11-04 | High |
+| Field meanings (official) | Timestamps are **UTC** (ISO 8601, e.g. `2026-02-17T16:00:00.000Z`); prices in **pence** (e.g. `123.9`); fuel codes `E5`, `E10`, `B7_Standard`, `B7_Premium`, `B10`, `HVO` (the CSV uses `B7S`/`B7P`) | Developer-portal field guide | High |
+| Discrepancy link | `https://www.fuel-finder.service.gov.uk/motorist/price-report` | Developer-portal config | High |
 
-Also unknown: whether timestamps carry a UTC offset or are naive London local time; whether prices are pence or pounds; the exact fuel-type codes (E10/E5/B7/…?). The probe answers all three.
+Timestamps (UTC), units (pence) and fuel codes are now documented officially (rows above). The probe still checks that real responses match.
 
 ---
 
@@ -260,8 +262,26 @@ On every PR: `ruff check` + `ruff format --check`, `pytest` (recorded fixtures o
 
 ## 7. Build order (one branch/PR each)
 
+**Priority (revised 2026-11-04): start recording UK prices before anything else.** Each day before the poller runs is a day of price changes the archive will never have. dbt, DESNZ/Brent and Tankerkönig wait until raw data is flowing.
+
 | # | Branch | Delivers | Depends on |
 |---|---|---|---|
+| 1 | `chore/scaffold` | uv project, config, http client (retries + backoff), CLI skeleton, ruff, minimal CI, MIT LICENSE | — |
+| 2 | `feat/raw-storage` | write-once writer, manifest, state, **run log** (every run recorded, including failures, so gaps are visible), tests | 1 |
+| 3a | `feat/csv-recorder` *(only if you approve the email route, see §8)* | twice-daily public CSV saved raw via the subscription email | 2 |
+| 3 | `feat/fuel-finder-client` | auth + paged client + error types, tested with mocked responses | 1 |
+| 4 | **`feat/history-depth-probe`** | probe, **run on your Mac the day credentials arrive**, `docs/history-depth.md` | 2, 3, credentials |
+| 5 | `feat/fuel-finder-poller` | a small poller that **writes raw files only**: incremental every 5 min plus daily full prices and stations; retries; every run (including failures) logged; tolerant of missing fields | 4 |
+| 5b | `ops/mac-launchd` | **interim:** a launchd job runs the poller on your Mac while Azure isn't live; the run log shows the sleep gaps | 5 |
+| 6 | `deploy/collector-uk` | ghcr.io image, Azure Container Apps Jobs (UK South), R2 bucket, re-run probe from Azure, then retire launchd | 5, Cloudflare account |
+| 7 | `feat/dbt-staging-fuel-finder` | dbt project, Fuel Finder staging models + tests, fixture raw store, `dbt build` in CI | 5 |
+| 8 | `feat/desnz-brent` | DESNZ weekly + Brent ingestion + staging | 2 |
+| 9 | `feat/tankerkoenig` | German ingestion + staging (DE DST tests) | 2 |
+| 10 | `docs/phase-1-wrap` | `data-sources.md`, `compliance.md` draft, README freshness badge, Phase 1 definition-of-done check | all |
+
+Steps 1–2 can be built today without credentials, so the poller is ready the moment they arrive. Expect API gaps: the service had severe performance problems in its first days (Feb 2026) and removed fields later that month. Hence the retries, the logging of every failed run and the tolerance for missing fields.
+
+---|---|---|---|
 | 1 | `chore/scaffold` | uv project, config, http client, CLI skeleton, ruff, minimal CI, README stub, MIT LICENSE | — |
 | 2 | `feat/raw-storage` | write-once writer, manifest, state, tests (incl. "refuses overwrite") | 1 |
 | 3 | `feat/fuel-finder-client` | auth + paged client + error types, tested with mocked responses | 1 |
@@ -287,6 +307,7 @@ Decided:
 - ~~Location~~: stays in `~/Desktop/milemap`.
 
 Still open:
+0. **Public CSV via email (new).** The CSV has no scriptable URL. Should the recorder read the Fuel Finder subscription emails in your Hotmail (read-only, only messages from the Fuel Finder sender) to fetch each new CSV, or do we skip the CSV and wait for API credentials?
 1. **Accounts you'll need to create** (all free; I can't do these for you): an Azure account (asks for a card for verification), a Cloudflare account with R2 enabled (R2 also asks for a payment method on file, though usage stays within the free tier), and later a Hugging Face account.
 2. **Endpoint details.** Once you have portal access, paste the incremental endpoint spec (path, param name, date format), or save the OpenAPI/Swagger file into `docs/`.
 
